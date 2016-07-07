@@ -1,0 +1,1155 @@
+#include<stdio.h>
+#include<stdlib.h>
+#include<string.h>
+#include<math.h>
+#include<unistd.h>
+#include"storage_mgr.h"
+#include"buffer_mgr.h"
+#include"record_mgr.h"
+#include"tables.h"
+
+#define MAKE_VARSTRING(var)				\
+do {							\
+var = (VarString *) malloc(sizeof(VarString));	\
+var->size = 0;					\
+var->bufsize = 100;					\
+var->buf = malloc(100);				\
+} while (0)
+
+#define FREE_VARSTRING(var)			\
+do {						\
+free(var->buf);				\
+free(var);					\
+} while (0)
+
+#define GET_STRING(result, var)			\
+do {						\
+result = malloc((var->size) + 1);		\
+memcpy(result, var->buf, var->size);	\
+result[var->size] = '\0';			\
+} while (0)
+
+#define RETURN_STRING(var)			\
+do {						\
+char *resultStr;				\
+GET_STRING(resultStr, var);			\
+FREE_VARSTRING(var);			\
+return resultStr;				\
+} while (0)
+
+#define ENSURE_SIZE(var,newsize)				\
+do {								\
+if (var->bufsize < newsize)					\
+{								\
+int newbufsize = var->bufsize;				\
+while((newbufsize *= 2) < newsize);			\
+var->buf = realloc(var->buf, newbufsize);			\
+}								\
+} while (0)
+
+#define APPEND_STRING(var,string)					\
+do {									\
+ENSURE_SIZE(var, var->size + strlen(string));			\
+memcpy(var->buf + var->size, string, strlen(string));		\
+var->size += strlen(string);					\
+} while(0)
+
+#define APPEND(var, ...)			\
+do {						\
+char *tmp = malloc(10000);			\
+sprintf(tmp, __VA_ARGS__);			\
+APPEND_STRING(var,tmp);			\
+free(tmp);					\
+} while(0)
+
+void updateRecordInfo(Record *record, int pageNumber,int slotNumber);
+
+RC
+attrOffset (Schema *schema, int attrNum, int *result)
+{
+    int offset = 0;
+    int attrPos = 0;
+
+    for(attrPos = 0; attrPos < attrNum; attrPos++)
+        switch (schema->dataTypes[attrPos])
+    {
+        case DT_STRING:
+            offset += schema->typeLength[attrPos];
+            break;
+        case DT_INT:
+            offset += sizeof(int);
+            break;
+        case DT_FLOAT:
+            offset += sizeof(float);
+            break;
+        case DT_BOOL:
+            offset += sizeof(bool);
+            break;
+    }
+
+    *result = offset;
+    return RC_OK;
+}
+
+
+	//tombstone Node used for efficient management of memory in case of
+	//delete functionality 
+	typedef struct tombStoneNode {
+		struct tombStoneNode *next;
+		RID id;
+	}tombStoneNode;
+
+
+//record manager related info.
+typedef struct recordTableInfo{
+	BM_BufferPool *bufferManager;
+	int maximumPageSlot;
+    int numberOfTuples;
+    int schemaSize;
+    int tombStoneLength;
+    tombStoneNode *tombStoneHead;
+    int recordStart;
+    int recordEnd;
+    int slotSize;
+}recordTableInfo;
+
+typedef struct VariabString {
+    char *buf;
+    int size;
+    int bufsize;
+} VarString;
+
+
+typedef struct searchRecord {
+    int numberOfPagesPerRelation;
+    int numberOfSlotsPerRelation;
+    Expr *condition;
+    int currentRecordSlotNo;
+    int currentRecordPageNo;
+}searchRecord;
+
+	recordTableInfo *getRecordManagerTableInfo(RM_TableData *rel){
+		 recordTableInfo *recordTable = (recordTableInfo *) (rel->mgmtData);
+		 return recordTable;
+	}
+	
+
+
+	int processTombStone(recordTableInfo *recordTable){
+		tombStoneNode *tombStoneStart;
+		tombStoneStart = recordTable->tombStoneHead;
+		int tombStoneCount = 0,i=0;
+		for(i=0;tombStoneStart != NULL;i++){
+			tombStoneStart = tombStoneStart->next;
+			tombStoneCount++;
+		}
+		return tombStoneCount;
+	}
+	
+	char *stringFromTableMaker(recordTableInfo *recordTable,VarString *varString){
+			tombStoneNode *tombStoneStart = recordTable->tombStoneHead;
+			char *outputString;
+			int i;
+			for(i=0;tombStoneStart != NULL;i++){
+				APPEND(varString,"%i:%i%s ",tombStoneStart->id.page, tombStoneStart->id.slot, (tombStoneStart->next != NULL) ? ", ": "");
+				tombStoneStart = tombStoneStart->next;
+			}
+			APPEND_STRING(varString, ">\n");				\
+			GET_STRING(outputString, varString);
+			return outputString;
+		}
+		
+	char *translateTableToString(recordTableInfo *recordTable){
+		char *outputString;
+		VarString *varString;
+		MAKE_VARSTRING(varString);
+		APPEND(varString, "SchemaLength <%i> FirstRecordPage <%i> LastRecordPage <%i> NumTuples <%i> SlotSize <%i> MaxSlots <%i> ", recordTable->schemaSize, recordTable->recordStart, recordTable->recordEnd, recordTable->numberOfTuples, recordTable->slotSize, recordTable->maximumPageSlot);
+		int tombStoneCount =processTombStone(recordTable);
+		APPEND(varString, "tNodeLen <%i> <", tombStoneCount);
+		outputString=stringFromTableMaker(recordTable,varString);
+		return outputString;
+
+	}
+	
+	recordTableInfo *initRecordManagerTableInfo(){
+		   recordTableInfo *recordTable = (recordTableInfo*) malloc(sizeof(recordTableInfo));
+		   return recordTable;
+	}
+
+	void stringTokenize(char **s1){
+		 *s1 = strtok (NULL,"<");
+		 *s1 = strtok (NULL,">");
+	}
+	
+	long int strtExtraction(char **s1,char **s2){
+		long int extractedData=strtol((*s1), &(*s2), 10);
+		return extractedData;
+	}
+	
+	void processDataForTomb(recordTableInfo *recordTable,int pageNumber,int slotNumber){
+			tombStoneNode *tnode;
+			if (recordTable->tombStoneHead != NULL){
+            tnode->next = (tombStoneNode *)malloc(sizeof(tombStoneNode));
+            tnode->next->id.page = pageNumber;
+            tnode->next->id.slot = slotNumber;
+            tnode = tnode->next;
+        }
+        else{
+            recordTable->tombStoneHead = (tombStoneNode *)malloc(sizeof(tombStoneNode));
+            recordTable->tombStoneHead->id.page = pageNumber;
+            recordTable->tombStoneHead->id.slot = slotNumber;
+            tnode = recordTable->tombStoneHead;
+			}
+		}
+	
+	recordTableInfo *processTombData(recordTableInfo *recordTable,char **s1,char **s2){
+		int k, pageNumber, slotNumber;
+		recordTable->tombStoneHead = NULL;
+		while(k<recordTable->tombStoneLength){
+        *s1 = strtok (NULL,":");
+        pageNumber = strtExtraction(&(*s1),&(*s2));
+        if(k != (recordTable->tombStoneLength - 1)){
+            *s1 = strtok (NULL,",");
+        }
+        else{
+            *s1 = strtok (NULL,">");
+        }
+        slotNumber = strtExtraction(&(*s1),&(*s2));
+        processDataForTomb(recordTable,pageNumber,slotNumber);
+			k++;
+		}
+		return recordTable;
+	}
+	
+	recordTableInfo *TranslateStringToRecordTable(char *recordTableInfoString){
+		char recordTableData[strlen(recordTableInfoString)];
+		strcpy(recordTableData, recordTableInfoString);	
+		recordTableInfo *recordTable = initRecordManagerTableInfo();
+		char *s1, *s2;
+		s1 = strtok (recordTableData,"<");
+		s1 = strtok (NULL,">");
+		recordTable->schemaSize = strtExtraction(&s1,&s2);
+		stringTokenize(&s1);
+		recordTable->recordStart = strtExtraction(&s1,&s2);
+		stringTokenize(&s1);
+		recordTable->recordEnd =  strtExtraction(&s1,&s2);
+		stringTokenize(&s1);
+		recordTable->numberOfTuples =  strtExtraction(&s1,&s2);
+		stringTokenize(&s1);
+		recordTable->slotSize =  strtExtraction(&s1,&s2);
+		stringTokenize(&s1);
+		recordTable->maximumPageSlot =  strtExtraction(&s1,&s2);
+		stringTokenize(&s1);
+		recordTable->tombStoneLength = strtExtraction(&s1,&s2);
+		s1 = strtok (NULL,"<");
+		recordTable=processTombData(recordTable,&s1,&s2);
+		return recordTable;
+	}
+
+
+
+	Schema *deserializeSchema(char *schema_str){
+	
+    Schema *schema = (Schema *) malloc(sizeof(Schema));
+    int i, j;
+
+    char schema_data[strlen(schema_str)];
+    strcpy(schema_data, schema_str);
+
+    char *temp1, *temp2;
+    temp1 = strtok (schema_data,"<");
+    temp1 = strtok (NULL,">");
+
+    int numAttr;
+    numAttr = strtol(temp1, &temp2, 10);
+    schema->numAttr= numAttr;
+
+    schema->attrNames=(char **)malloc(sizeof(char*)*numAttr);
+    schema->dataTypes=(DataType *)malloc(sizeof(DataType)*numAttr);
+    schema->typeLength=(int *)malloc(sizeof(int)*numAttr);
+    char* str_ref[numAttr];
+    temp1 = strtok (NULL,"(");
+
+    for(i=0; i<numAttr; ++i){
+        temp1 = strtok (NULL,": ");
+        schema->attrNames[i]=(char *)calloc(strlen(temp1), sizeof(char));
+        strcpy(schema->attrNames[i], temp1);
+
+        if(i != numAttr-1){
+			temp1 = strtok (NULL,", ");   
+        }
+        else{
+            temp1 = strtok (NULL,") ");
+        }
+
+        str_ref[i] = (char *)calloc(strlen(temp1), sizeof(char));
+
+        if (strcmp(temp1, "INT") == 0){
+            schema->dataTypes[i] = DT_INT;
+            schema->typeLength[i] = 0;
+        }
+        else if (strcmp(temp1, "FLOAT") == 0){
+            schema->dataTypes[i] = DT_FLOAT;
+            schema->typeLength[i] = 0;
+        }
+        else if (strcmp(temp1, "BOOL") == 0){
+            schema->dataTypes[i] = DT_BOOL;
+            schema->typeLength[i] = 0;
+        }
+        else{
+            strcpy(str_ref[i], temp1);
+        }
+    }
+
+    int keyFlag = 0, keySize = 0;
+    char* keyAttrs[numAttr];
+
+    if((temp1 = strtok (NULL,"(")) != NULL){
+        temp1 = strtok (NULL,")");
+        char *key = strtok (temp1,", ");
+
+        while(key != NULL){
+            keyAttrs[keySize] = (char *)malloc(strlen(key)*sizeof(char));
+            strcpy(keyAttrs[keySize], key);
+            keySize++;
+            key = strtok (NULL,", ");
+        }
+        keyFlag = 1;
+    }
+
+    char *temp3;
+    for(i=0; i<numAttr; ++i){
+        if(strlen(str_ref[i]) > 0){
+            temp3 = (char *) malloc(sizeof(char)*strlen(str_ref[i]));
+            memcpy(temp3, str_ref[i], strlen(str_ref[i]));
+            schema->dataTypes[i] = DT_STRING;
+            temp1 = strtok (temp3,"[");
+            temp1 = strtok (NULL,"]");
+            schema->typeLength[i] = strtol(temp1, &temp2, 10);
+            free(temp3);
+            free(str_ref[i]);
+        }
+    }
+
+    if(keyFlag == 1){
+        schema->keyAttrs=(int *)malloc(sizeof(int)*keySize);
+        schema->keySize = keySize;
+        for(i=0; i<keySize; ++i){
+            for(j=0; j<numAttr; ++j){
+                if(strcmp(keyAttrs[i], schema->attrNames[j]) == 0){
+                    schema->keyAttrs[i] = j;
+                    free(keyAttrs[i]);
+                }
+            }
+        }
+    }
+
+    return schema;
+}
+
+	//called to get page Hnadle pointer of buffer manager
+	BM_PageHandle *getBufferPageHandle(){
+		BM_PageHandle *pageHandle = (BM_PageHandle *)malloc(sizeof(BM_PageHandle));
+	}
+	
+
+	//called to calculate file size based on schema to be stored
+	int computefileSize(int schemaSize){
+		int fileSize=(int)(ceil((float)schemaSize/PAGE_SIZE));
+		return fileSize;
+		
+	}
+	
+	//called to calculate Max. slots for records per page
+	int calculateMaximumSlotsPerPage(int slotSize){
+		int maximumSlots=(int)(floor((double)(PAGE_SIZE/slotSize)));	
+		return maximumSlots;
+	}
+
+	//it populates the record manager necessory information to be used by various functions
+	recordTableInfo *populateRecordTableInfo(int schemaSize,int fileSize,int maximumSlots,int slotSize){
+		recordTableInfo *table_info=(recordTableInfo *) malloc(sizeof(recordTableInfo));
+		table_info->maximumPageSlot=maximumSlots;
+		table_info->numberOfTuples=0;
+		table_info->schemaSize=schemaSize;
+		table_info->slotSize=slotSize;
+		table_info->recordStart=fileSize+1;
+		table_info->recordEnd=fileSize+1;
+		table_info->tombStoneHead = NULL;
+		return table_info;
+	}
+
+	//return number of tuples of record stored in page
+	int getNumTuples (RM_TableData *rel){
+    return ((recordTableInfo *)rel->mgmtData)->numberOfTuples;
+	}
+	
+	
+	
+	RC freeRecord (Record *record){
+	//freeing space for record's data and then record
+    free(record->data);
+    free(record);
+    return RC_OK;
+	}
+	
+	
+	
+	
+	RC openingFile(char *name,SM_FileHandle fHandle){
+		RC flag;
+		if((flag=openPageFile(name, &fHandle)) != RC_OK){
+			return flag;
+		}else{
+			return flag;
+			}
+	}
+	
+	RC writeToFile(SM_FileHandle fHandle,recordTableInfo *recordTable){
+		char *recordTableString = translateTableToString(recordTable);
+		RC flag;
+		if ((flag=writeBlock(0, &fHandle, recordTableString)) != RC_OK){
+			free(recordTableString);
+			return flag;
+		}else{
+			free(recordTableString);
+			return flag;
+		}
+	}
+	
+	RC closeFile(SM_FileHandle fHandle){
+		RC flag;
+		if ((flag=closePageFile(&fHandle)) != RC_OK){
+        return flag;
+		}
+		return flag;
+	}
+	
+	
+	bool checkTableToExist(char *name){
+		if(access(name, 0) == -1) {
+        return false;
+		}else{
+			return true;
+		}
+	}
+	
+	
+	//called to write table to file
+	RC tableInformationToFileData(char *name, Record *record,recordTableInfo *recordTable){
+    SM_FileHandle fHandle;
+    RC flag;
+    
+    //checks if table is exist or not
+		if(!checkTableToExist(name)) {
+			return TABLE_DOES_NOT_EXIST;
+		}
+		
+		//opens the page file
+		flag=openPageFile(name,&fHandle);
+		if(flag==RC_OK){
+			//writing to page file the created table
+				flag=writeToFile(fHandle,recordTable);
+				if(flag==RC_OK){
+					//closing the page file
+					flag=closeFile(fHandle);
+					if(flag!=RC_OK){
+						return RC_OK;
+					}else{
+						return flag;
+					}
+					
+				}else{
+					return flag;	
+				}
+		}else{
+				return flag;
+			}
+	}
+	
+	
+	void pageOperation(recordTableInfo *recordTable,int pageNumber,int slotNumber,RM_TableData *rel, Record *record){
+		//get the buffer manager page handle pointer to be used to write
+		//data to the page file
+		BM_PageHandle *pageHandle=getBufferPageHandle();
+		//before writing record to pageFile serialize the record to be written
+		char *rString = serializeRecord(record, rel->schema);
+		//writing record to page
+		pinPage(recordTable->bufferManager, pageHandle, pageNumber);
+		//copy the  serialize data of record to the page data's last availble location
+		memcpy(pageHandle->data + (slotNumber*recordTable->slotSize), rString, strlen(rString));
+		//mark page as dirty before writing it back to disk
+		markDirty(recordTable->bufferManager, pageHandle);
+		//unpinning the page will decreases its fixed count
+		unpinPage(recordTable->bufferManager, pageHandle);
+		//this action will write the page data to page file on disk as its 
+		//marked as dirty
+		
+		forcePage(recordTable->bufferManager, pageHandle);
+		
+		//making tombstone to false which is an indication that record slot is full and its not deleted
+		record->id.tombS = false;
+		//increasing number of tuples to keep the trak of records inserted
+		recordTable->numberOfTuples+=1;
+		
+		tableInformationToFileData(rel->name,record ,recordTable);
+		//freeing memory of pageHandle and serialized record
+		free(pageHandle);
+		free(rString);
+	}
+	
+	void pageHandleOperations(recordTableInfo *recordTable,int pageNumber,int slotNumber,RM_TableData *rel,Record *record,int temp){
+		int i=0;
+		while(temp<10){
+			i++;
+			temp++;
+		}
+		
+		pageOperation(recordTable,pageNumber,slotNumber,rel,record);
+	}
+	
+	
+	//writing schema to page file page 1  and also writing table information to page 0 
+	RC writeSchemaToTable(recordTableInfo *recordTable,SM_FileHandle fHandle,Schema *schema){
+		RC flag;
+		int i;
+		char *TableInfoString = translateTableToString(recordTable);
+
+		if ((flag=writeBlock(0, &fHandle, TableInfoString)) == RC_OK){
+			
+			char *schemaToString = serializeSchema(schema);	
+			if ((flag=writeBlock(1, &fHandle, schemaToString)) == RC_OK){
+				if ((flag=closePageFile(&fHandle)) == RC_OK){
+					i=1;
+				}else{
+					return flag;
+				}
+				
+			}else{
+			return flag;
+			
+			}
+		}else{
+			return flag;
+		}
+		
+	}
+	
+	
+	
+	
+	
+	
+	
+		
+
+RC createTable (char *name, Schema *schema){
+	
+	if(createPageFile(name)==RC_OK){
+		
+		RC flag;
+		int k=0,schemaSize=0,slotSize=15,dtLength=0,fileSize=0,maximumSlots=0;	
+		//calculating the shema size
+		
+		while(k<schema->numAttr){
+        schemaSize=schemaSize+ strlen(schema->attrNames[k]);
+        k++;
+		}
+		
+		schemaSize+=sizeof(int)+sizeof(int)+sizeof(int)*(schema->numAttr)+sizeof(int)*(schema->numAttr)+sizeof(int)*(schema->keySize);
+		//compute size of file required for schema
+		
+		fileSize=computefileSize(schemaSize);
+		for(k=0; k<schema->numAttr; k++){
+			if(schema->dataTypes[k]==DT_STRING){
+				dtLength=schema->typeLength[k];
+			}else if(schema->dataTypes[k]==DT_BOOL){
+				dtLength=5;
+			}else if(schema->dataTypes[k]==DT_INT){
+				dtLength=5;
+			}else if(schema->dataTypes[k]==DT_FLOAT){
+				dtLength=10;
+			}
+			slotSize=slotSize+(dtLength + strlen(schema->attrNames[k]) + 2);
+		}	
+		
+		
+		//calculating maximum number of slots per page
+		maximumSlots=calculateMaximumSlotsPerPage(slotSize);
+		
+		 SM_FileHandle fHandle;
+		 //opening the page file
+		 flag=openPageFile(name, &fHandle);
+		 if(flag!=RC_OK){
+			 return flag;
+		 }else{
+			 //creating a room to store schema so that fileSize+1;
+			 ensureCapacity((fileSize + 1), &fHandle);
+
+			//initilaze record manager information
+			recordTableInfo *table_info=populateRecordTableInfo(schemaSize,fileSize,maximumSlots,slotSize);
+			//call to function which writes schema and table information to file.
+
+			writeSchemaToTable(table_info,fHandle,schema);
+
+		}
+		return RC_OK;
+		
+	}
+}
+
+	//called to get pointer to buffer manager
+	BM_BufferPool *getBufferManager(){
+		BM_BufferPool *bManager = (BM_BufferPool *)malloc(sizeof(BM_BufferPool));
+	}
+	
+	
+	
+	//called to initialize the buffer manager to be used to store schema and related information
+	recordTableInfo *initBufferManagerForRecord(char *name,struct BM_BufferPool *bManager,struct BM_PageHandle *pageHandle){
+			
+			//initliazing buffer manager with 3 page frames and FIFO as replacement Strategy
+			initBufferPool(bManager, name, 3, RS_FIFO, NULL);
+			//pinning the 0th page of buffer mananger
+			pinPage(bManager, pageHandle, 0);
+			//record table translation from string as table
+			recordTableInfo *recordTable = TranslateStringToRecordTable(pageHandle->data);
+			
+			
+			if(recordTable->schemaSize < PAGE_SIZE){
+				//pinning the 1st page if schemaLength is less than PAGE_SIZE
+				pinPage(bManager, pageHandle, 1);
+			}
+			return recordTable;
+	}
+	
+		extern RC initRecordManager (void *mgmtData)
+		{
+			return RC_OK;
+		}
+	//opening a Table for storing of records. It requires Buffer manager to be initilazed for stroring records
+	//block wise
+	RC openTable (RM_TableData *rel, char *name){
+			//checks if table is already there or not
+			if(access(name,0)!=-1){
+			
+			//get pointer to buffer Manager
+			BM_BufferPool *bManager = getBufferManager();
+			//get pointer to pageHandle of buffer manager
+			BM_PageHandle *pageHandle = getBufferPageHandle();
+			
+			//get the record table initlialized by which will pin pages 
+			//via buffer manager to store deserialized schema for records
+			recordTableInfo *recordTable = initBufferManagerForRecord(name,bManager,pageHandle);
+			//deserializing schema for store it in file
+			
+			rel->schema = deserializeSchema(pageHandle->data);
+			//setting the record manager related information 
+			//to be used by record manager for performing different functions
+			rel->name = name;
+			recordTable->bufferManager = bManager;
+			rel->mgmtData = recordTable;
+			//freeing space used by pageHandle
+			free(pageHandle);
+			return RC_OK;
+			
+		}else{
+			//if table doesn't exist return an error
+			return TABLE_DOES_NOT_EXIST;
+		}
+	}
+
+	RC closeTable (RM_TableData *rel){
+		//shutting down the buffer pool to release meory and all 
+		//pined pages and dirty pages will be written back to disk
+		shutdownBufferPool(((recordTableInfo *)rel->mgmtData)->bufferManager);
+		//releasing memory for all schema fields
+		freeMemoryOfRecordManager(rel);
+		return RC_OK;
+	}
+	
+	//free memory related to schema
+	RC freeMemoryOfRecordManager(RM_TableData *rel){
+		free(rel->schema->dataTypes);
+		free(rel->schema->keyAttrs);
+		free(rel->schema->attrNames);
+		free(rel->schema->typeLength);
+		free(rel->mgmtData);
+		free(rel->schema);
+		return RC_OK;
+	}
+	
+	RC deleteTable (char *name){
+    if(access(name, 0) != -1) {
+		if(remove(name) == 0){
+			return RC_OK;
+		}else{
+			return TABLE_DOES_NOT_EXIST;
+		}	
+	}
+	else{
+			return TABLE_DOES_NOT_EXIST;
+		}
+    
+	}
+	
+
+	RC shutdownRecordManager (){
+    return RC_OK;
+	}
+	
+	
+	//it calculates record size by iterating throgh schema
+	int getRecordSize (Schema *schema){
+		int recordSize=0,counter=0;
+		
+		//based on number of attribute per schema calculate 
+		//size of each attribute based on its data type
+		while(counter<schema->numAttr){
+		//if attribute is string
+		if(schema->dataTypes[counter]==DT_STRING){
+				recordSize+=schema->typeLength[counter];
+		//if attribute is Boolean
+			}else if(schema->dataTypes[counter]==DT_BOOL){
+				recordSize+=sizeof(bool);
+			//if attribute is INT
+			}else if(schema->dataTypes[counter]==DT_INT){
+				recordSize+=sizeof(int);
+				//if attribute is FLOAT
+			}else if(schema->dataTypes[counter]==DT_FLOAT){
+				recordSize+=sizeof(float);
+			}	
+		counter++;
+		}
+		return recordSize;
+	}
+	
+	
+	//creating schema based on parameters passed
+	Schema *createSchema (int numAttr, char **attrNames, DataType *dataTypes, int *typeLength, int keySize, int *keys){
+		Schema *schema = (Schema *) malloc(sizeof(Schema));
+		schema->attrNames = attrNames;
+		schema->numAttr = numAttr;
+		schema->keySize = keySize;
+		schema->dataTypes = dataTypes;
+		schema->attrNames = attrNames;
+		schema->typeLength = typeLength;
+		schema->keyAttrs = keys;
+		return schema;
+	}
+	
+	//releasing the memory allocated for schema
+	RC freeSchema (Schema *schema){
+		free(schema);
+		return RC_OK;
+	}
+	
+	int calculateSlotNumber(int pageNumber,recordTableInfo *recordTable){
+		//calculate slot number
+		int slotNumber = recordTable->numberOfTuples - ((pageNumber - recordTable->recordStart)*recordTable->maximumPageSlot) ;	
+		return slotNumber;
+	}
+	
+	int setSlotNumber(recordTableInfo *recordTable){
+			int slotNumber,i=0;
+			while(i<1){
+				slotNumber = recordTable->tombStoneHead->id.slot;
+				i++;
+			}
+	}
+	
+	int setPageNumber(recordTableInfo *recordTable){
+		int pageNumber;
+		pageNumber = recordTable->tombStoneHead->id.page;
+		//pointing to next tombstone record
+        recordTable->tombStoneHead = recordTable->tombStoneHead->next;
+		return pageNumber;
+	}
+	
+	
+	//called at the time of insertion of record
+	RC insertRecord (RM_TableData *rel, Record *record){
+		int pageNumber, slotNumber,temp=0;
+		//get the record manager related info.
+		recordTableInfo *recordTable=getRecordManagerTableInfo(rel);
+		
+		if (recordTable->tombStoneHead == NULL){
+		//if no tombstone record found
+		//then insert at the end of last recod at page
+		pageNumber = recordTable->recordEnd;
+		slotNumber=calculateSlotNumber(pageNumber,recordTable);
+      
+		//if slot number is equal to max allowed slot on page
+		//then increase page number to next and make slot number to 0
+		 if (slotNumber != recordTable->maximumPageSlot){
+           
+			}else{
+				slotNumber = 0;
+				pageNumber+=1;
+			}
+			
+        //saving pointer to last inserted record
+        recordTable->recordEnd = pageNumber;
+		}//as we have to created the linked list of
+		//deleted records and marked each record as tombstone
+		//so before inserting we have to check whether any space with 
+		//tombstone, if yes then insert new record to that place
+		//else write record to the end of last record
+		else{
+			//if any recod with tombstone then insert new record at that place
+			temp=1;
+			slotNumber = setSlotNumber(recordTable);
+			pageNumber = setPageNumber(recordTable);
+		}
+		
+		updateRecordInfo(record,pageNumber,slotNumber);
+		pageHandleOperations(recordTable,pageNumber,slotNumber,rel,record,temp);
+		return RC_OK;
+		
+		
+	}
+	
+	void updateRecordInfo(Record *record, int pageNumber,int slotNumber){
+		//populating record ID and slot to
+		//record where new record inserted
+		record->id.page = pageNumber;
+		record->id.slot = slotNumber;
+		
+	}
+	
+	
+	
+	//called to create record and allocates memory to it.
+	RC createRecord (Record **record, Schema *schema){
+	*record = (Record *)  malloc(sizeof(Record));
+    (*record)->data = (char *)malloc((getRecordSize(schema)));
+    return RC_OK;
+	}
+	
+	//calculates the position of each of the attribute in schema
+	int setPositionalDifference(Schema *schema, int attrNum){
+		int positionalDifference;
+		attrOffset(schema, attrNum, &positionalDifference);
+		return positionalDifference;
+	}
+	
+	void setStringAttribute(char *attribute,char *sValue,int length,Value **value){
+		strncpy(sValue, attribute, length);
+		sValue[length] = '\0';
+		(*value)->v.stringV = sValue;
+	}
+	
+	//change this function fully
+	RC getAttr (Record *record, Schema *schema, int attrNum, Value **value){
+		int length;
+		int positionalDifference;
+		//allocating memory space to value
+		 *value = (Value *)  malloc(sizeof(Value));
+		 (*value)->dt = schema->dataTypes[attrNum];
+		 char *attribute, *sValue;
+		//getting attribute value position for each attributes
+		positionalDifference=setPositionalDifference(schema,attrNum);
+		attribute = (record->data) + positionalDifference;
+		if(schema->dataTypes[attrNum]==DT_STRING){
+			length = schema->typeLength[attrNum];
+			sValue = (char *) malloc(length + 1);
+		}
+		if(schema->dataTypes[attrNum]==DT_INT){//if attribute is Int
+			memcpy(&((*value)->v.intV),attribute, sizeof(int));
+		}else if(schema->dataTypes[attrNum]==DT_BOOL){//if attribute is Boolean
+			printf("\nBOOOLLL   %s\n",attribute);
+			memcpy(&((*value)->v.boolV),attribute, sizeof(bool));
+		}else if(schema->dataTypes[attrNum]==DT_FLOAT){//if attribute is Float
+			 memcpy(&((*value)->v.floatV),attribute, sizeof(float));
+		}else if(schema->dataTypes[attrNum]==DT_STRING){//if attribute is String
+			setStringAttribute(attribute,sValue,length,value);
+		}
+			return RC_OK;
+	}
+	
+	RC setAttr (Record *record, Schema *schema, int attrNum, Value *value){
+		int length;
+		int positionalDifference;
+		char *attribute, *sValue;
+		//getting attribute value position for each attributes
+		positionalDifference=setPositionalDifference(schema,attrNum);
+		attribute = (record->data) + positionalDifference;
+		if(schema->dataTypes[attrNum]==DT_STRING){
+			length = schema->typeLength[attrNum];
+			sValue = (char *) malloc(length);
+			sValue = value->v.stringV;
+		}
+		if(schema->dataTypes[attrNum]==DT_INT){//if attribute is Int
+			 memcpy(attribute,&(value->v.intV), sizeof(int));
+		}else if(schema->dataTypes[attrNum]==DT_BOOL){//if attribute is Boolean
+			 memcpy(attribute,&((value->v.boolV)), sizeof(bool));
+		}else if(schema->dataTypes[attrNum]==DT_FLOAT){//if attribute is Float
+			memcpy(attribute,&((value->v.floatV)), sizeof(float));
+		}else if(schema->dataTypes[attrNum]==DT_STRING){//if attribute is String
+            memcpy(attribute,(sValue), length);
+		}
+			return RC_OK;
+	}
+	
+	
+	searchRecord *initSearchRecord(){
+		searchRecord *recordSearch = (searchRecord *) malloc(sizeof(searchRecord));
+		return recordSearch;
+		}
+	
+		void initialize_Scanner(RM_TableData *rel,searchRecord *recordSearch,Expr *cond){
+			recordSearch->numberOfSlotsPerRelation = ((recordTableInfo *)rel->mgmtData)->slotSize;
+			recordSearch->numberOfPagesPerRelation = ((recordTableInfo *)rel->mgmtData)->recordEnd;
+			recordSearch->currentRecordPageNo = ((recordTableInfo *)rel->mgmtData)->recordStart;
+			recordSearch->currentRecordSlotNo = 0;
+			recordSearch->condition = cond;
+		}
+	
+	void findRecordInScheme(RM_TableData *rel, RM_ScanHandle *scan, Expr *cond) {
+		//initializing RM_ScanHandle data structure
+		scan->rel = rel;
+		//initializing recordSearch to store information about record to 
+		 //searched and to evaluate a condition
+		searchRecord *recordSearch = initSearchRecord();
+		initialize_Scanner(rel,recordSearch,cond);
+		// recordSearch to scan->mgmtData
+		scan->mgmtData = (void *) recordSearch;
+	}
+	
+	RC startScan (RM_TableData *rel, RM_ScanHandle *scan, Expr *cond){
+	findRecordInScheme(rel, scan, cond);
+    return RC_OK;
+	}
+
+	searchRecord *getSearchRecordPointer(RM_ScanHandle *scan){
+		searchRecord *recordSearch=scan->mgmtData;
+		return recordSearch; 
+	}
+	
+	void populateScanData(Record *record,searchRecord *recordSearch){
+		record->id.slot = recordSearch->currentRecordSlotNo;
+		record->id.page = recordSearch->currentRecordPageNo;
+	}
+	
+	void updateRecordSearch(searchRecord *recordSearch){
+		(recordSearch->currentRecordPageNo)+=1;
+		recordSearch->currentRecordSlotNo = 0;
+	}
+	
+	void Evaluate(RM_ScanHandle *scan, Record *record,Value *value,searchRecord *recordSearch){
+		evalExpr(record, scan->rel->schema, recordSearch->condition, &(value));
+	}
+	
+	RC next (RM_ScanHandle *scan, Record *record){
+		RC flag;
+		Value *value;
+		searchRecord *recordSearch=getSearchRecordPointer(scan);
+		populateScanData(record,recordSearch);
+		
+		//retrieve record with respect to page number and record id
+		flag = getRecord(scan->rel, record->id, record);
+
+		if(flag != RC_RM_NO_MORE_TUPLES){
+			
+				if(record->id.tombS){
+					
+					if (recordSearch->currentRecordSlotNo == recordSearch->numberOfSlotsPerRelation - 1){
+						
+						updateRecordSearch(recordSearch);
+						scan->mgmtData = recordSearch;
+						return next(scan, record);
+					}
+					else{
+						
+						(recordSearch->currentRecordSlotNo)+=1;
+						printf("\ntesttt\n");
+						scan->mgmtData = recordSearch;
+						return next(scan, record);
+					}
+				
+			}
+			else{
+				
+				Evaluate(scan,record,value,recordSearch);
+				
+				if (recordSearch->currentRecordSlotNo != recordSearch->numberOfSlotsPerRelation - 1){
+					
+					(recordSearch->currentRecordSlotNo)+=1;
+					scan->mgmtData = recordSearch;
+					
+				}
+				else{
+					printf("\nproblem is here2\n");
+					updateRecordSearch(recordSearch);
+					scan->mgmtData = recordSearch;
+				}
+
+					printf("\nproblem is\n");
+				if(value->v.boolV!=1){
+					
+					return next(scan, record);
+				}
+				else{
+					printf("\nproblem is hereq1\n");
+					return RC_OK;
+				}
+			}
+		}else{
+			return RC_RM_NO_MORE_TUPLES;
+		}
+
+		
+	}
+	
+	RC closeScan (RM_ScanHandle *scan){
+		//free(scan);
+		return RC_OK;
+	}
+	
+	RC deleteRecord (RM_TableData *rel, RID id){
+		return RC_OK;
+	}
+	
+	RC updateRecord (RM_TableData *rel, Record *record){
+		return RC_OK;
+	}
+	
+	Record *getRecordInitilaized(){
+		Record *record = (Record *) malloc(sizeof(Record));
+		return record;
+	}
+	char *getRecordDataInitialized(recordTableInfo *recordTable){
+		char *data = (char *)malloc(sizeof(char) * recordTable->slotSize);
+		return data;
+	}
+	
+	char *getToken(char *recData){
+		char *t;
+		t = strtok(recData,"-");
+		t = strtok (NULL,"]");
+		t = strtok (NULL,"(");
+		return t;
+	}
+	
+	void setAttributeValues(Record *record, Schema *schema, int loop,Value *value,char *s2){
+		setAttr (record, schema, loop, value);
+	}
+	
+	void dBasedOnDataType(char *s1, Record *record, Schema *schema, int loop){
+		Value *value;
+		char *s2;
+		 if(schema->dataTypes[loop]==DT_INT)
+            {
+                int intVal = strtol(s1, &s2, 10);
+                MAKE_VALUE(value, DT_INT, intVal);
+                setAttributeValues(record, schema, loop, value,s2);
+            }
+            else if(schema->dataTypes[loop]==DT_STRING)
+            {
+                MAKE_STRING_VALUE(value, s1);
+				setAttributeValues(record, schema, loop, value,s2);
+            }
+               else if(schema->dataTypes[loop]==DT_FLOAT)
+            {
+                float floatVal = strtof(s1, NULL);
+                MAKE_VALUE(value, DT_FLOAT, floatVal);
+                setAttributeValues(record, schema, loop, value,s2);
+            }
+            else if(schema->dataTypes[loop]==DT_BOOL)  
+            {
+                 bool boolVal;
+                boolVal = (s1[0] == 't') ? TRUE : FALSE;
+                MAKE_VALUE(value, DT_BOOL, boolVal);
+                setAttributeValues(record, schema, loop, value,s2);
+            }
+		freeVal(value);
+	}
+	
+	Record *dRecord(RM_TableData *rel,char *stringRecord){
+		char recData[strlen(stringRecord)];
+		strcpy(recData, stringRecord);
+		Schema *schema = rel->schema;
+		int loop=0,temp=0;
+		recordTableInfo *recordTable = getRecordManagerTableInfo(rel);
+		Record *record = getRecordInitilaized();
+		record->data = getRecordDataInitialized(recordTable);
+		char *s1;
+		s1=getToken(recData);
+		free(stringRecord);
+		while(loop<schema->numAttr){
+			s1 = strtok (NULL,":");
+			if(loop != (schema->numAttr - 1)){
+				 s1 = strtok (NULL,",");
+			}
+			else{
+				s1 = strtok (NULL,")");
+			}
+			dBasedOnDataType(s1,record,schema,loop);
+			loop+=1;
+			temp=temp+1;
+		}
+		return record;
+	}
+	
+	
+	void updateIDBased(RID id,int *pageNumber,int *slotNumber){
+		*pageNumber = id.page;
+		*slotNumber = id.slot;
+	}
+	
+	bool checkTombStone(Record *record,recordTableInfo *recordTable,RID id,int pageNumber,int slotNumber, int *tcount){
+		tombStoneNode *tombNode = recordTable->tombStoneHead;
+		bool tFlag=false;
+		int i=0;
+		while(i<recordTable->tombStoneLength){
+			if (tombNode->id.page == pageNumber && tombNode->id.slot == slotNumber){
+				tFlag = true;
+				record->id.tombS = true;
+				break;
+			}
+			tombNode = tombNode->next;
+			(*tcount)+=1;
+			i++;
+		}
+		return tFlag;
+	}
+	
+	void getRecordPageOperation(RM_TableData *rel,Record *record,recordTableInfo *recordTable,BM_PageHandle *pageHandle,int pageNumber,int slotNumber){
+			char *stringRecord = (char *) malloc(sizeof(char) * recordTable->slotSize);
+			int i=0;
+			while(i<1){
+			pinPage(recordTable->bufferManager, pageHandle, pageNumber);
+			memcpy(stringRecord, pageHandle->data + ((slotNumber)*recordTable->slotSize), sizeof(char)*recordTable->slotSize);
+			unpinPage(recordTable->bufferManager, pageHandle);	
+			Record *temp_record = dRecord(rel,stringRecord);
+			record->data = temp_record->data;
+			free(temp_record);
+			i++;
+		}
+		free(pageHandle);
+	}
+	
+	RC getRecord (RM_TableData *rel, RID id, Record *record){
+		BM_PageHandle *pageHandle=getBufferPageHandle();
+		recordTableInfo *recordTable=getRecordManagerTableInfo(rel);
+		int pageNumber, slotNumber;
+		updateIDBased(id,&pageNumber,&slotNumber);
+		updateRecordInfo(record,pageNumber,slotNumber);
+		record->id.tombS = false;
+		int tcount=0;
+		bool tFlag=checkTombStone(record,recordTable,id,pageNumber,slotNumber,&tcount);
+		if(pageHandle!=NULL){
+				if (!tFlag){
+					int tupleNumber = (pageNumber - recordTable->recordStart)*(recordTable->maximumPageSlot) + slotNumber + 1 - tcount;
+					if (tupleNumber<=recordTable->numberOfTuples){
+						getRecordPageOperation(rel,record,recordTable,pageHandle,pageNumber,slotNumber);
+					}else{
+							free(pageHandle);
+							return RC_RM_NO_MORE_TUPLES;
+						}
+				}
+		}else{
+			free(pageHandle);
+		}
+		return RC_OK;
+	}

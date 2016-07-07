@@ -1,0 +1,127 @@
+The code execution for Buffer Manager starts with building the code with Make file 
+which is responsible for creating the test_assign2_1 Binary file and linking 
+test_assign2_1.c file with all corresponding *.h and *.c files. 
+Make file inter-links each of the files in the directory with each other.
+
+Procedure to Execute the buffer manager:-
+
+1)Copy all the files to one folder
+2)In Unix Terminal navigate to folder where files are stored.
+3)Execute "make" command
+4)Execute "./test_assign2_1" command
+
+
+Structure of Buffer manager
+
+buffer_mgr.h --> It has definition for various structures and functions to be used by 
+buffer_mgr.c. 
+
+buffer_mgr.c --> It is the main file which contains the Buffer manager function used to initialize
+buffer as per the number of PageFrames. It is used to copy file in pages from disk to 
+PageFrame. It checks for fixedcount of Pages and Dirty bits to write the edited page back to 
+disk. It contain FIFO and LRU agorithm to evict pages based on algorithm strategy if page frames are full.
+
+buffer_mgr_stat.c --> This file contains the BufferPool statistic functions.
+
+buffer_mgr_stat.h --> his file contains the BufferPool statistic functions definitions.
+
+dberror.c --> It contains printerror and errormessage function. 
+For the specific error it outputs the error code and specific error message
+
+dberror.h --> It defines page_size constant as 4096 and definition for
+RC(return codes) for various File and Block functions in storage_mgr.
+ 
+dt.h --> It contains constant variables for True and False. 
+ 
+storage_mgr.h--> This is the file responsible for containing various file and block 
+functions which are called from test_assign1_1.c It contains read and write function from
+file on disk to buffer and vise-versa. It contains creating, opening and closing file 
+functions as well. It implements dberror.h and test_helpers.h file.
+ 
+test_assign2_1.c --> This file calls upon each and every function within Buffer_mgr.c file.
+This file contains the test cases which checks each and every function within buffer_mgr.c
+
+test_helper.h -> The file contains validation tasks for each function that are called 
+within test_assign1. It is responsible for printing the RC code and RC message passed 
+based on function's success or failure depnding on the values being passed to it.
+
+
+Buffer Manager Functions:-
+
+1. initBufferPool(BM_BufferPool *const bm, const char *const pageFileName, 
+		  const int numPages, ReplacementStrategy strategy, 
+		  void *stratData)
+This function initializes the buffer Pool manager. It allocates memory to variables
+pointed by bufferpool using memset function and initializes few others to zero.
+It creates a Head node and subsequent frames in BufferPool.
+
+2. int *getFixCounts (BM_BufferPool *const bm)
+This function loops through all the frames created in BufferPool and returns the PageFrameFixedCount
+for each frame in BufferPool.
+ 
+3. int getNumReadIO (BM_BufferPool *const bm)
+This function returns the number of Pages that have been read from disk from the time
+BufferPool is been initialized.
+ 
+4. int getNumWriteIO (BM_BufferPool *const bm)
+This function returns the number of Pages that have been written to disk from the time
+BufferPool is been initialized.
+ 
+5. bool *getDirtyFlags (BM_BufferPool *const bm)
+This function loops throught the PageFrames in BufferPool and returns the boolean value after
+checking which frame in the BufferPool is Dirty.
+ 
+6. markDirty (BM_BufferPool *const bm, BM_PageHandle *const page)
+This function loops through the PageFrames in BufferPool and checks if the Page within page frame is same as page to be modified by client then mark page as dirty.
+
+
+7. unpinPage (BM_BufferPool *const bm, BM_PageHandle *const page)
+This function loops through the PageFrames in BufferPool and finds the page to be unPinned
+as well as decreasing  its Fixed count by 1.
+
+8. pinPage (BM_BufferPool *const bm, BM_PageHandle *const page, const PageNumber pageNum)
+Ths function pins the Page with pageNum in PageFrame of BufferPool. It also load the page from disk file to PageFrame. It is a main function which calls upon FIFO algorithmor LRU algorithm based on the strategy requested if there are no empty page frames.
+
+9. shutdownBufferPool(BM_BufferPool *const bm)
+This function first call the forceFlushPool(bm).
+This function then proceeds to shuts down a BufferPool while looping through all the 
+PageFrames in BufferPool to check if a page is marked dirty, if so then they have to be 
+written back to file on disk. It also frees up all the memory allocated to PageFrames.
+
+10. forceFlushPool(BM_BufferPool *const bm)
+This function loops through all the PageFrame in BufferPool and checks if a page is dirty.
+It then checks if the fixedcount for the page is 0 and if so then it writes the page content
+ to the file on disk.
+
+11. forcePage (BM_BufferPool *const bm, BM_PageHandle *const page)
+This function write the content of current page having dirtybit, to file on disk.
+
+12. PageNumber *getFrameContents (BM_BufferPool *const bm)
+This function returns the pagenumber of page stored in page frame.
+
+13. locateNode(BM_BufferPool *const bm,BM_PageHandle *const page,const PageNumber pageNum )
+This function locates the page requested in PageFrame of BufferPool as per the pageNum 
+value passed to it and returns page pointer if found or returns NULL.
+
+14. locateNodeinMemory(BM_BufferPool *const bm, BM_PageHandle *const page, const PageNumber pageNum)
+This function calls the locateNode(bm,page, pageNum) function to find the requested page
+in PageFrame of BufferPool. If the page is found then fixedcount of page increases and page 
+data gets copied to Page in PageFrame. If the Page is not found then it return NULL.
+
+15. updatePageHead(BM_BufferPool *const bm,pageFrame *node)
+This function loops through the Pages in PageFrame of BufferPool which needs to be replaced and update the pointers within page frames accordingly.
+
+16. updatePage(BM_BufferPool *const bm,BM_PageHandle *const page,pageFrame *node,const PageNumber pageNum)
+This function calls various Storage Manager functions from storage_mgr.c
+like openPageFile, ensureCapacity, writeBlock and readBlock.
+Function is responsible to replace the page and read the requested page to replaced page frame.
+
+17. fifo (BM_BufferPool *const bm, BM_PageHandle *const page, const PageNumber pageNum)
+This function implements the FIFO algorithm by calling the 
+locateNodeinMemory(bm,page,pageNum) function to find if the PageFrame
+already has the page requested by the client. if not then it checks for an empty page frame and loads page into empty page frame. if no page frames are empty then it locates and replaces the page which has come first in page frame having fixed count =0. 
+
+18. LRU (BM_BufferPool *const bm, BM_PageHandle *const page,const PageNumber pageNum)
+This function implements the LRU algorithm by calling the 
+locateNodeinMemory(bm,page,pageNum) function to find if the PageFrame
+already has the page requested by the client. if not then it checks for an empty page frame and loads page into empty page frame. if no page frames are empty then it locates and replaces the page which is being least recently used in past with fixed count=0
